@@ -148,8 +148,21 @@ function Get-UnixSystemLayout {
         }
     }
 
+    $tempInstallRoot = "/tmp/picoclaw-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+
+    try {
+        Get-ChildItem -Path '/tmp' -Filter 'picoclaw-*' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                if ($_.FullName -ne $tempInstallRoot) {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+    } catch {
+        # Best-effort cleanup; ignore any failures to avoid breaking installation.
+    }
+
     return @{
-        installRoot = "/tmp/picoclaw-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+        installRoot = $tempInstallRoot
         linkDir     = '/usr/bin'
         mode        = 'copy-executables'
     }
