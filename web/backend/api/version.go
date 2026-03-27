@@ -43,9 +43,10 @@ func newSystemVersionCache() *systemVersionCache {
 }
 
 var (
-	// Reuse the launcher gateway startup window so embedded/slow devices
-	// have enough time for first-run command initialization.
-	versionCmdTimeout           = gatewayStartupWindow
+	// 15 seconds matches the gateway startup window used elsewhere in launcher flow,
+	// giving slow/embedded hosts enough time for first command invocation while
+	// staying independent from cross-file init ordering.
+	versionCmdTimeout           = 15 * time.Second
 	findPicoclawBinaryForInfo   = utils.FindPicoclawBinary
 	runPicoclawVersionOutput    = executePicoclawVersion
 	currentGatewayVersionState  = gatewayVersionState
@@ -64,7 +65,10 @@ func (h *Handler) handleGetVersion(w http.ResponseWriter, r *http.Request) {
 	versionInfo := h.resolveSystemVersionInfo(r.Context())
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(versionInfo)
+	if err := json.NewEncoder(w).Encode(versionInfo); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 // resolveSystemVersionInfo prefers the actual picoclaw binary version output,
