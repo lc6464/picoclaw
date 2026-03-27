@@ -4,15 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 )
 
+func setupVersionTestIsolation(t *testing.T) {
+	t.Helper()
+
+	originalGatewayState := currentGatewayVersionState
+	originalMonitorInterval := versionCacheMonitorInterval
+	t.Cleanup(func() {
+		currentGatewayVersionState = originalGatewayState
+		versionCacheMonitorInterval = originalMonitorInterval
+		versionInfoCache.resetForTest()
+	})
+
+	currentGatewayVersionState = func() (int, bool) { return 0, false }
+	versionCacheMonitorInterval = 10 * time.Millisecond
+	versionInfoCache.resetForTest()
+}
+
 func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
+	setupVersionTestIsolation(t)
+
 	originalVersion := config.Version
 	originalGitCommit := config.GitCommit
 	originalBuildTime := config.BuildTime
@@ -70,6 +90,8 @@ func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
 }
 
 func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
+	setupVersionTestIsolation(t)
+
 	originalVersion := config.Version
 	originalGitCommit := config.GitCommit
 	originalBuildTime := config.BuildTime
@@ -127,6 +149,8 @@ func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 }
 
 func TestParsePicoclawVersionOutput(t *testing.T) {
+	setupVersionTestIsolation(t)
+
 	raw := "\u001b[1;31m████\u001b[0m\n🦞 picoclaw 18ec263 (git: 18ec2631)\n  Build: 2026-03-27T10:43:34+0000\n  Go: go1.25.8\n"
 	got, ok := parsePicoclawVersionOutput(raw)
 	if !ok {
@@ -147,6 +171,8 @@ func TestParsePicoclawVersionOutput(t *testing.T) {
 }
 
 func TestResolveSystemVersionInfoFallsBackRuntimeGoVersion(t *testing.T) {
+	setupVersionTestIsolation(t)
+
 	originalVersion := config.Version
 	originalGitCommit := config.GitCommit
 	originalBuildTime := config.BuildTime
@@ -173,8 +199,137 @@ func TestResolveSystemVersionInfoFallsBackRuntimeGoVersion(t *testing.T) {
 	}
 
 	h := NewHandler("")
-	got := h.resolveSystemVersionInfo()
+	got := h.resolveSystemVersionInfo(context.Background())
 	if got.GoVersion != runtime.Version() {
 		t.Fatalf("go_version = %q, want runtime version %q", got.GoVersion, runtime.Version())
+	}
+}
+
+func TestResolveSystemVersionInfoCachesWhileGatewayAlive(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	originalVersion := config.Version
+	originalFinder := findPicoclawBinaryForInfo
+	originalRunner := runPicoclawVersionOutput
+	originalGatewayState := currentGatewayVersionState
+	t.Cleanup(func() {
+		config.Version = originalVersion
+		findPicoclawBinaryForInfo = originalFinder
+		runPicoclawVersionOutput = originalRunner
+		currentGatewayVersionState = originalGatewayState
+	})
+
+	config.Version = "dev"
+	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
+
+	pid := 4321
+	currentGatewayVersionState = func() (int, bool) { return pid, true }
+
+	runCount := 0
+	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
+		runCount++
+		return fmt.Sprintf("picoclaw v1.2.%d\n", runCount), nil
+	}
+
+	h := NewHandler("")
+	first := h.resolveSystemVersionInfo(context.Background())
+	second := h.resolveSystemVersionInfo(context.Background())
+
+	if first.Version != "v1.2.1" {
+		t.Fatalf("first version = %q, want %q", first.Version, "v1.2.1")
+	}
+	if second.Version != "v1.2.1" {
+		t.Fatalf("second version = %q, want cached %q", second.Version, "v1.2.1")
+	}
+	if runCount != 1 {
+		t.Fatalf("run count = %d, want %d", runCount, 1)
+	}
+}
+
+func TestResolveSystemVersionInfoInvalidatesCacheWhenGatewayStops(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	originalVersion := config.Version
+	originalFinder := findPicoclawBinaryForInfo
+	originalRunner := runPicoclawVersionOutput
+	originalGatewayState := currentGatewayVersionState
+	t.Cleanup(func() {
+		config.Version = originalVersion
+		findPicoclawBinaryForInfo = originalFinder
+		runPicoclawVersionOutput = originalRunner
+		currentGatewayVersionState = originalGatewayState
+	})
+
+	config.Version = "dev"
+	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
+
+	alive := true
+	pid := 9876
+	currentGatewayVersionState = func() (int, bool) {
+		if !alive {
+			return 0, false
+		}
+		return pid, true
+	}
+
+	runCount := 0
+	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
+		runCount++
+		return fmt.Sprintf("picoclaw v2.0.%d\n", runCount), nil
+	}
+
+	h := NewHandler("")
+	first := h.resolveSystemVersionInfo(context.Background())
+	second := h.resolveSystemVersionInfo(context.Background())
+
+	if first.Version != "v2.0.1" || second.Version != "v2.0.1" {
+		t.Fatalf("expected cached version v2.0.1, got first=%q second=%q", first.Version, second.Version)
+	}
+	if runCount != 1 {
+		t.Fatalf("run count after cache hit = %d, want %d", runCount, 1)
+	}
+
+	alive = false
+	third := h.resolveSystemVersionInfo(context.Background())
+	if third.Version != "v2.0.2" {
+		t.Fatalf("third version = %q, want refreshed %q", third.Version, "v2.0.2")
+	}
+	if runCount != 2 {
+		t.Fatalf("run count after invalidation = %d, want %d", runCount, 2)
+	}
+}
+
+func TestResolveSystemVersionInfoSkipsCommandWhenContextCanceled(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	originalVersion := config.Version
+	originalFinder := findPicoclawBinaryForInfo
+	originalRunner := runPicoclawVersionOutput
+	t.Cleanup(func() {
+		config.Version = originalVersion
+		findPicoclawBinaryForInfo = originalFinder
+		runPicoclawVersionOutput = originalRunner
+	})
+
+	config.Version = "v3.0.0"
+	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
+
+	runCount := 0
+	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
+		runCount++
+		return "picoclaw v9.9.9\n", nil
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h := NewHandler("")
+	got := h.resolveSystemVersionInfo(canceledCtx)
+
+	if runCount != 0 {
+		t.Fatalf("run count = %d, want %d", runCount, 0)
+	}
+	if got.Version != "v3.0.0" {
+		t.Fatalf("version = %q, want fallback %q", got.Version, "v3.0.0")
 	}
 }

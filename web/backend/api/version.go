@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/web/backend/utils"
@@ -22,14 +24,35 @@ type systemVersionResponse struct {
 	GoVersion string `json:"go_version"`
 }
 
+type cachedSystemVersion struct {
+	value      systemVersionResponse
+	gatewayPID int
+}
+
+type systemVersionCache struct {
+	mu            sync.Mutex
+	current       cachedSystemVersion
+	hasCurrent    bool
+	inflightCh    chan struct{}
+	monitorPID    int
+	monitorCancel context.CancelFunc
+}
+
+func newSystemVersionCache() *systemVersionCache {
+	return &systemVersionCache{}
+}
+
 var (
 	// Reuse the launcher gateway startup window so embedded/slow devices
 	// have enough time for first-run command initialization.
-	versionCmdTimeout         = gatewayStartupWindow
-	findPicoclawBinaryForInfo = utils.FindPicoclawBinary
-	runPicoclawVersionOutput  = executePicoclawVersion
-	versionLinePattern        = regexp.MustCompile(`\bpicoclaw\s+([^\s(]+)(?:\s+\(git:\s*([^)]+)\))?`)
-	ansiEscapePattern         = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	versionCmdTimeout           = gatewayStartupWindow
+	findPicoclawBinaryForInfo   = utils.FindPicoclawBinary
+	runPicoclawVersionOutput    = executePicoclawVersion
+	currentGatewayVersionState  = gatewayVersionState
+	versionCacheMonitorInterval = 5 * time.Second
+	versionInfoCache            = newSystemVersionCache()
+	versionLinePattern          = regexp.MustCompile(`\bpicoclaw\s+([^\s(]+)(?:\s+\(git:\s*([^)]+)\))?`)
+	ansiEscapePattern           = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
 
 func (h *Handler) registerVersionRoutes(mux *http.ServeMux) {
@@ -37,8 +60,8 @@ func (h *Handler) registerVersionRoutes(mux *http.ServeMux) {
 }
 
 // handleGetVersion returns runtime version information for web clients.
-func (h *Handler) handleGetVersion(w http.ResponseWriter, _ *http.Request) {
-	versionInfo := h.resolveSystemVersionInfo()
+func (h *Handler) handleGetVersion(w http.ResponseWriter, r *http.Request) {
+	versionInfo := h.resolveSystemVersionInfo(r.Context())
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(versionInfo)
@@ -46,24 +69,44 @@ func (h *Handler) handleGetVersion(w http.ResponseWriter, _ *http.Request) {
 
 // resolveSystemVersionInfo prefers the actual picoclaw binary version output,
 // and falls back to launcher build metadata when command execution fails.
-func (h *Handler) resolveSystemVersionInfo() systemVersionResponse {
-	buildTime, goVer := config.FormatBuildInfo()
-	fallback := systemVersionResponse{
-		Version:   config.GetVersion(),
-		GitCommit: config.GitCommit,
-		BuildTime: buildTime,
-		GoVersion: goVer,
+func (h *Handler) resolveSystemVersionInfo(ctx context.Context) systemVersionResponse {
+	for {
+		gatewayPID, gatewayAlive := currentGatewayVersionState()
+		if cached, ok := versionInfoCache.get(gatewayPID, gatewayAlive); ok {
+			return cached
+		}
+
+		leader, ok := versionInfoCache.waitOrStart(ctx)
+		if !ok {
+			return fallbackSystemVersionInfo()
+		}
+		if !leader {
+			continue
+		}
+
+		resolved := h.resolveSystemVersionInfoUncached(ctx)
+		gatewayPID, gatewayAlive = currentGatewayVersionState()
+		versionInfoCache.finishResolve(resolved, gatewayPID, gatewayAlive)
+		return resolved
 	}
+}
+
+func (h *Handler) resolveSystemVersionInfoUncached(ctx context.Context) systemVersionResponse {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	fallback := fallbackSystemVersionInfo()
 
 	execPath := strings.TrimSpace(findPicoclawBinaryForInfo())
 	if execPath == "" {
 		return fallback
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), versionCmdTimeout)
+	cmdCtx, cancel := context.WithTimeout(ctx, versionCmdTimeout)
 	defer cancel()
 
-	output, err := runPicoclawVersionOutput(ctx, execPath)
+	output, err := runPicoclawVersionOutput(cmdCtx, execPath)
 	if err != nil {
 		return fallback
 	}
@@ -81,6 +124,161 @@ func (h *Handler) resolveSystemVersionInfo() systemVersionResponse {
 	}
 
 	return parsed
+}
+
+func fallbackSystemVersionInfo() systemVersionResponse {
+	buildTime, goVer := config.FormatBuildInfo()
+	return systemVersionResponse{
+		Version:   config.GetVersion(),
+		GitCommit: config.GitCommit,
+		BuildTime: buildTime,
+		GoVersion: goVer,
+	}
+}
+
+func gatewayVersionState() (int, bool) {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+
+	if gateway.cmd == nil || gateway.cmd.Process == nil {
+		return 0, false
+	}
+	pid := gateway.cmd.Process.Pid
+	if pid <= 0 {
+		return 0, false
+	}
+
+	return pid, isCmdProcessAliveLocked(gateway.cmd)
+}
+
+func (c *systemVersionCache) get(gatewayPID int, gatewayAlive bool) (systemVersionResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.hasCurrent && (!gatewayAlive || gatewayPID <= 0 || gatewayPID != c.current.gatewayPID) {
+		c.clearCurrentLocked()
+	}
+
+	if c.hasCurrent {
+		return c.current.value, true
+	}
+
+	return systemVersionResponse{}, false
+}
+
+func (c *systemVersionCache) waitOrStart(ctx context.Context) (bool, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false, false
+	}
+
+	c.mu.Lock()
+	if c.inflightCh == nil {
+		c.inflightCh = make(chan struct{})
+		c.mu.Unlock()
+		return true, true
+	}
+	waitCh := c.inflightCh
+	c.mu.Unlock()
+
+	select {
+	case <-waitCh:
+		return false, true
+	case <-ctx.Done():
+		return false, false
+	}
+}
+
+func (c *systemVersionCache) finishResolve(value systemVersionResponse, gatewayPID int, gatewayAlive bool) {
+	c.mu.Lock()
+	if gatewayAlive && gatewayPID > 0 {
+		c.current = cachedSystemVersion{value: value, gatewayPID: gatewayPID}
+		c.hasCurrent = true
+		c.ensureMonitorLocked(gatewayPID)
+	} else {
+		c.clearCurrentLocked()
+	}
+
+	inflightCh := c.inflightCh
+	c.inflightCh = nil
+	c.mu.Unlock()
+
+	if inflightCh != nil {
+		close(inflightCh)
+	}
+}
+
+func (c *systemVersionCache) clearCurrentLocked() {
+	c.hasCurrent = false
+	c.current = cachedSystemVersion{}
+	c.stopMonitorLocked()
+}
+
+func (c *systemVersionCache) ensureMonitorLocked(gatewayPID int) {
+	if c.monitorPID == gatewayPID && c.monitorCancel != nil {
+		return
+	}
+
+	c.stopMonitorLocked()
+	ctx, cancel := context.WithCancel(context.Background())
+	c.monitorPID = gatewayPID
+	c.monitorCancel = cancel
+
+	go monitorGatewayVersionCache(ctx, gatewayPID)
+}
+
+func (c *systemVersionCache) stopMonitorLocked() {
+	if c.monitorCancel != nil {
+		c.monitorCancel()
+		c.monitorCancel = nil
+	}
+	c.monitorPID = 0
+}
+
+func (c *systemVersionCache) invalidateForPID(gatewayPID int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.hasCurrent && c.current.gatewayPID == gatewayPID {
+		c.current = cachedSystemVersion{}
+		c.hasCurrent = false
+	}
+	if c.monitorPID == gatewayPID {
+		c.stopMonitorLocked()
+	}
+}
+
+func (c *systemVersionCache) resetForTest() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.current = cachedSystemVersion{}
+	c.hasCurrent = false
+	c.stopMonitorLocked()
+	if c.inflightCh != nil {
+		close(c.inflightCh)
+		c.inflightCh = nil
+	}
+}
+
+func monitorGatewayVersionCache(ctx context.Context, gatewayPID int) {
+	ticker := time.NewTicker(versionCacheMonitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentPID, alive := currentGatewayVersionState()
+			if !alive || currentPID != gatewayPID {
+				versionInfoCache.invalidateForPID(gatewayPID)
+				return
+			}
+		}
+	}
 }
 
 // executePicoclawVersion runs the version subcommand against the
