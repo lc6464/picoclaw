@@ -50,10 +50,11 @@ func isProcessRunning(pid int) bool {
 			return false
 		}
 		return strings.Contains(string(output), fmt.Sprintf(" %d ", pid))
+	default:
+		// Linux and other unix-like systems.
+		_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+		return err == nil
 	}
-	// Linux
-	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
-	return err == nil
 }
 
 func getGatewayStatus() gatewayStatus {

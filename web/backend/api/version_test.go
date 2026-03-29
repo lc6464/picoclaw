@@ -7,51 +7,36 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"runtime"
 	"testing"
-	"time"
-
-	"github.com/sipeed/picoclaw/pkg/config"
 )
 
 func setupVersionTestIsolation(t *testing.T) {
 	t.Helper()
 
 	originalGatewayState := currentGatewayVersionState
-	originalMonitorInterval := versionCacheMonitorInterval
+	originalFinder := findPicoclawBinaryForInfo
+	originalRunner := runPicoclawVersionOutput
+	originalFallback := launcherBuildInfoForVersion
 	t.Cleanup(func() {
 		currentGatewayVersionState = originalGatewayState
-		versionCacheMonitorInterval = originalMonitorInterval
+		findPicoclawBinaryForInfo = originalFinder
+		runPicoclawVersionOutput = originalRunner
+		launcherBuildInfoForVersion = originalFallback
 		versionInfoCache.resetForTest()
 	})
 
 	currentGatewayVersionState = func() (int, bool) { return 0, false }
-	versionCacheMonitorInterval = 10 * time.Millisecond
 	versionInfoCache.resetForTest()
 }
 
 func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalGitCommit := config.GitCommit
-	originalBuildTime := config.BuildTime
-	originalGoVersion := config.GoVersion
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		config.GitCommit = originalGitCommit
-		config.BuildTime = originalBuildTime
-		config.GoVersion = originalGoVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-	})
-
-	config.Version = "dev"
-	config.GitCommit = ""
-	config.BuildTime = ""
-	config.GoVersion = ""
+	launcherBuildInfoForVersion = func() systemVersionResponse {
+		return systemVersionResponse{Version: "fallback", GoVersion: "go-fallback"}
+	}
 
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
@@ -92,25 +77,13 @@ func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
 func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalGitCommit := config.GitCommit
-	originalBuildTime := config.BuildTime
-	originalGoVersion := config.GoVersion
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		config.GitCommit = originalGitCommit
-		config.BuildTime = originalBuildTime
-		config.GoVersion = originalGoVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-	})
-
-	config.Version = "v9.9.9"
-	config.GitCommit = "cafebabe"
-	config.BuildTime = "2026-03-27T10:43:34+0000"
-	config.GoVersion = "go1.25.8"
+	expected := systemVersionResponse{
+		Version:   "v9.9.9",
+		GitCommit: "cafebabe",
+		BuildTime: "2026-03-27T10:43:34+0000",
+		GoVersion: "go1.25.8",
+	}
+	launcherBuildInfoForVersion = func() systemVersionResponse { return expected }
 
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
@@ -134,17 +107,17 @@ func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 		t.Fatalf("unmarshal response: %v", err)
 	}
 
-	if got.Version != config.Version {
-		t.Fatalf("version = %q, want %q", got.Version, config.Version)
+	if got.Version != expected.Version {
+		t.Fatalf("version = %q, want %q", got.Version, expected.Version)
 	}
-	if got.GitCommit != config.GitCommit {
-		t.Fatalf("git_commit = %q, want %q", got.GitCommit, config.GitCommit)
+	if got.GitCommit != expected.GitCommit {
+		t.Fatalf("git_commit = %q, want %q", got.GitCommit, expected.GitCommit)
 	}
-	if got.BuildTime != config.BuildTime {
-		t.Fatalf("build_time = %q, want %q", got.BuildTime, config.BuildTime)
+	if got.BuildTime != expected.BuildTime {
+		t.Fatalf("build_time = %q, want %q", got.BuildTime, expected.BuildTime)
 	}
-	if got.GoVersion != config.GoVersion {
-		t.Fatalf("go_version = %q, want %q", got.GoVersion, config.GoVersion)
+	if got.GoVersion != expected.GoVersion {
+		t.Fatalf("go_version = %q, want %q", got.GoVersion, expected.GoVersion)
 	}
 }
 
@@ -170,28 +143,38 @@ func TestParsePicoclawVersionOutput(t *testing.T) {
 	}
 }
 
+func TestParsePicoclawVersionOutputIgnoresUsageLine(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "Usage: picoclaw version [flags]\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if ok {
+		t.Fatalf("parsePicoclawVersionOutput() parsed usage line unexpectedly: %#v", got)
+	}
+}
+
+func TestParsePicoclawVersionOutputAcceptsLetterOnlyHashVersion(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "picoclaw abcdefa (git: abcdefabcdefabcdefabcdefabcdefabcdefabcd)\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if !ok {
+		t.Fatal("parsePicoclawVersionOutput() should parse letter-only hash version")
+	}
+	if got.Version != "abcdefa" {
+		t.Fatalf("version = %q, want %q", got.Version, "abcdefa")
+	}
+	if got.GitCommit != "abcdefabcdefabcdefabcdefabcdefabcdefabcd" {
+		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
+	}
+}
+
 func TestResolveSystemVersionInfoFallsBackRuntimeGoVersion(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalGitCommit := config.GitCommit
-	originalBuildTime := config.BuildTime
-	originalGoVersion := config.GoVersion
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		config.GitCommit = originalGitCommit
-		config.BuildTime = originalBuildTime
-		config.GoVersion = originalGoVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-	})
-
-	config.Version = "dev"
-	config.GitCommit = ""
-	config.BuildTime = ""
-	config.GoVersion = ""
+	launcherBuildInfoForVersion = func() systemVersionResponse {
+		return systemVersionResponse{Version: "dev", GoVersion: ""}
+	}
 
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
@@ -208,18 +191,9 @@ func TestResolveSystemVersionInfoFallsBackRuntimeGoVersion(t *testing.T) {
 func TestResolveSystemVersionInfoCachesWhileGatewayAlive(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	originalGatewayState := currentGatewayVersionState
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-		currentGatewayVersionState = originalGatewayState
-	})
-
-	config.Version = "dev"
+	launcherBuildInfoForVersion = func() systemVersionResponse {
+		return systemVersionResponse{Version: "dev", GoVersion: "go-fallback"}
+	}
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 
 	pid := 4321
@@ -249,18 +223,9 @@ func TestResolveSystemVersionInfoCachesWhileGatewayAlive(t *testing.T) {
 func TestResolveSystemVersionInfoInvalidatesCacheWhenGatewayStops(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	originalGatewayState := currentGatewayVersionState
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-		currentGatewayVersionState = originalGatewayState
-	})
-
-	config.Version = "dev"
+	launcherBuildInfoForVersion = func() systemVersionResponse {
+		return systemVersionResponse{Version: "dev", GoVersion: "go-fallback"}
+	}
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 
 	alive := true
@@ -302,16 +267,9 @@ func TestResolveSystemVersionInfoInvalidatesCacheWhenGatewayStops(t *testing.T) 
 func TestResolveSystemVersionInfoSkipsCommandWhenContextCanceled(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	originalVersion := config.Version
-	originalFinder := findPicoclawBinaryForInfo
-	originalRunner := runPicoclawVersionOutput
-	t.Cleanup(func() {
-		config.Version = originalVersion
-		findPicoclawBinaryForInfo = originalFinder
-		runPicoclawVersionOutput = originalRunner
-	})
-
-	config.Version = "v3.0.0"
+	launcherBuildInfoForVersion = func() systemVersionResponse {
+		return systemVersionResponse{Version: "v3.0.0", GoVersion: "go-fallback"}
+	}
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 
 	runCount := 0
@@ -331,5 +289,29 @@ func TestResolveSystemVersionInfoSkipsCommandWhenContextCanceled(t *testing.T) {
 	}
 	if got.Version != "v3.0.0" {
 		t.Fatalf("version = %q, want fallback %q", got.Version, "v3.0.0")
+	}
+}
+
+func TestResolveGatewayBinaryForVersionInfoPrefersGatewayCommandPath(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	originalFinder := findPicoclawBinaryForInfo
+	t.Cleanup(func() {
+		findPicoclawBinaryForInfo = originalFinder
+	})
+
+	gateway.mu.Lock()
+	originalCmd := gateway.cmd
+	gateway.cmd = &exec.Cmd{Path: "/tmp/picoclaw-from-gateway"}
+	gateway.mu.Unlock()
+	t.Cleanup(func() {
+		gateway.mu.Lock()
+		gateway.cmd = originalCmd
+		gateway.mu.Unlock()
+	})
+
+	got := resolveGatewayBinaryForVersionInfo()
+	if got != "/tmp/picoclaw-from-gateway" {
+		t.Fatalf("exec path = %q, want %q", got, "/tmp/picoclaw-from-gateway")
 	}
 }

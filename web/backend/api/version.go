@@ -30,12 +30,10 @@ type cachedSystemVersion struct {
 }
 
 type systemVersionCache struct {
-	mu            sync.Mutex
-	current       cachedSystemVersion
-	hasCurrent    bool
-	inflightCh    chan struct{}
-	monitorPID    int
-	monitorCancel context.CancelFunc
+	mu         sync.Mutex
+	current    cachedSystemVersion
+	hasCurrent bool
+	inflightCh chan struct{}
 }
 
 func newSystemVersionCache() *systemVersionCache {
@@ -47,12 +45,13 @@ var (
 	// giving slow/embedded hosts enough time for first command invocation while
 	// staying independent from cross-file init ordering.
 	versionCmdTimeout           = 15 * time.Second
-	findPicoclawBinaryForInfo   = utils.FindPicoclawBinary
+	maxVersionResolveAttempts   = 3
+	findPicoclawBinaryForInfo   = resolveGatewayBinaryForVersionInfo
 	runPicoclawVersionOutput    = executePicoclawVersion
 	currentGatewayVersionState  = gatewayVersionState
-	versionCacheMonitorInterval = 5 * time.Second
+	launcherBuildInfoForVersion = fallbackSystemVersionInfoFromConfig
 	versionInfoCache            = newSystemVersionCache()
-	versionLinePattern          = regexp.MustCompile(`\bpicoclaw\s+([^\s(]+)(?:\s+\(git:\s*([^)]+)\))?`)
+	versionLinePattern          = regexp.MustCompile(`^(?:[^A-Za-z0-9]*\s*)?picoclaw(?:\.exe)?\s+([^\s(]+)(?:\s+\(git:\s*([^)]+)\))?\s*$`)
 	ansiEscapePattern           = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
 
@@ -74,7 +73,7 @@ func (h *Handler) handleGetVersion(w http.ResponseWriter, r *http.Request) {
 // resolveSystemVersionInfo prefers the actual picoclaw binary version output,
 // and falls back to launcher build metadata when command execution fails.
 func (h *Handler) resolveSystemVersionInfo(ctx context.Context) systemVersionResponse {
-	for {
+	for range maxVersionResolveAttempts {
 		gatewayPID, gatewayAlive := currentGatewayVersionState()
 		if cached, ok := versionInfoCache.get(gatewayPID, gatewayAlive); ok {
 			return cached
@@ -93,6 +92,8 @@ func (h *Handler) resolveSystemVersionInfo(ctx context.Context) systemVersionRes
 		versionInfoCache.finishResolve(resolved, gatewayPID, gatewayAlive)
 		return resolved
 	}
+
+	return fallbackSystemVersionInfo()
 }
 
 func (h *Handler) resolveSystemVersionInfoUncached(ctx context.Context) systemVersionResponse {
@@ -131,6 +132,10 @@ func (h *Handler) resolveSystemVersionInfoUncached(ctx context.Context) systemVe
 }
 
 func fallbackSystemVersionInfo() systemVersionResponse {
+	return launcherBuildInfoForVersion()
+}
+
+func fallbackSystemVersionInfoFromConfig() systemVersionResponse {
 	buildTime, goVer := config.FormatBuildInfo()
 	return systemVersionResponse{
 		Version:   config.GetVersion(),
@@ -138,6 +143,24 @@ func fallbackSystemVersionInfo() systemVersionResponse {
 		BuildTime: buildTime,
 		GoVersion: goVer,
 	}
+}
+
+// resolveGatewayBinaryForVersionInfo uses the same executable as the launcher
+// gateway start path when available, then falls back to launcher binary lookup.
+// This keeps version probing aligned with the actual gateway startup behavior,
+// so web and gateway do not drift onto different binaries.
+func resolveGatewayBinaryForVersionInfo() string {
+	gateway.mu.Lock()
+	cmd := gateway.cmd
+	gateway.mu.Unlock()
+
+	if cmd != nil {
+		if execPath := strings.TrimSpace(cmd.Path); execPath != "" {
+			return execPath
+		}
+	}
+
+	return utils.FindPicoclawBinary()
 }
 
 func gatewayVersionState() (int, bool) {
@@ -200,7 +223,6 @@ func (c *systemVersionCache) finishResolve(value systemVersionResponse, gatewayP
 	if gatewayAlive && gatewayPID > 0 {
 		c.current = cachedSystemVersion{value: value, gatewayPID: gatewayPID}
 		c.hasCurrent = true
-		c.ensureMonitorLocked(gatewayPID)
 	} else {
 		c.clearCurrentLocked()
 	}
@@ -217,41 +239,6 @@ func (c *systemVersionCache) finishResolve(value systemVersionResponse, gatewayP
 func (c *systemVersionCache) clearCurrentLocked() {
 	c.hasCurrent = false
 	c.current = cachedSystemVersion{}
-	c.stopMonitorLocked()
-}
-
-func (c *systemVersionCache) ensureMonitorLocked(gatewayPID int) {
-	if c.monitorPID == gatewayPID && c.monitorCancel != nil {
-		return
-	}
-
-	c.stopMonitorLocked()
-	ctx, cancel := context.WithCancel(context.Background())
-	c.monitorPID = gatewayPID
-	c.monitorCancel = cancel
-
-	go monitorGatewayVersionCache(ctx, gatewayPID)
-}
-
-func (c *systemVersionCache) stopMonitorLocked() {
-	if c.monitorCancel != nil {
-		c.monitorCancel()
-		c.monitorCancel = nil
-	}
-	c.monitorPID = 0
-}
-
-func (c *systemVersionCache) invalidateForPID(gatewayPID int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.hasCurrent && c.current.gatewayPID == gatewayPID {
-		c.current = cachedSystemVersion{}
-		c.hasCurrent = false
-	}
-	if c.monitorPID == gatewayPID {
-		c.stopMonitorLocked()
-	}
 }
 
 func (c *systemVersionCache) resetForTest() {
@@ -260,28 +247,9 @@ func (c *systemVersionCache) resetForTest() {
 
 	c.current = cachedSystemVersion{}
 	c.hasCurrent = false
-	c.stopMonitorLocked()
 	if c.inflightCh != nil {
 		close(c.inflightCh)
 		c.inflightCh = nil
-	}
-}
-
-func monitorGatewayVersionCache(ctx context.Context, gatewayPID int) {
-	ticker := time.NewTicker(versionCacheMonitorInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			currentPID, alive := currentGatewayVersionState()
-			if !alive || currentPID != gatewayPID {
-				versionInfoCache.invalidateForPID(gatewayPID)
-				return
-			}
-		}
 	}
 }
 
@@ -309,7 +277,11 @@ func parsePicoclawVersionOutput(raw string) (systemVersionResponse, bool) {
 		}
 
 		if match := versionLinePattern.FindStringSubmatch(line); len(match) > 0 {
-			result.Version = strings.TrimSpace(match[1])
+			candidateVersion := strings.TrimSpace(match[1])
+			if !isLikelyVersionValue(candidateVersion) {
+				continue
+			}
+			result.Version = candidateVersion
 			if len(match) > 2 {
 				result.GitCommit = strings.TrimSpace(match[2])
 			}
@@ -326,9 +298,45 @@ func parsePicoclawVersionOutput(raw string) (systemVersionResponse, bool) {
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return systemVersionResponse{}, false
+	}
+
 	if result.Version == "" {
 		return systemVersionResponse{}, false
 	}
 
 	return result, true
+}
+
+func isLikelyVersionValue(value string) bool {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if v == "" {
+		return false
+	}
+	if v == "dev" {
+		return true
+	}
+
+	// Accept git-like short/long hashes even when they contain only letters (a-f).
+	if len(v) >= 7 && len(v) <= 40 {
+		allHex := true
+		for _, ch := range v {
+			if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') {
+				continue
+			}
+			allHex = false
+			break
+		}
+		if allHex {
+			return true
+		}
+	}
+
+	for _, ch := range v {
+		if ch >= '0' && ch <= '9' {
+			return true
+		}
+	}
+	return false
 }
