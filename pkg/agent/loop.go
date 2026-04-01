@@ -74,6 +74,7 @@ type AgentLoop struct {
 // processOptions configures how a message is processed
 type processOptions struct {
 	SessionKey              string                 // Session identifier for history/context
+	SessionAliases          []string               // Compatibility aliases for the session key
 	Channel                 string                 // Target channel for tool execution
 	ChatID                  string                 // Target chat ID for tool execution
 	MessageID               string                 // Current inbound platform message ID
@@ -1475,6 +1476,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 
 	opts := processOptions{
 		SessionKey:        sessionKey,
+		SessionAliases:    buildSessionAliases(sessionKey, allocation.SessionKey, msg.SessionKey),
 		Channel:           msg.Channel,
 		ChatID:            msg.ChatID,
 		MessageID:         msg.MessageID,
@@ -1545,6 +1547,43 @@ func resolveScopeKey(routeSessionKey, msgSessionKey string) string {
 		return msgSessionKey
 	}
 	return routeSessionKey
+}
+
+func buildSessionAliases(canonicalKey string, keys ...string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	aliases := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	canonicalKey = strings.TrimSpace(canonicalKey)
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" || key == canonicalKey {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		aliases = append(aliases, key)
+	}
+	if len(aliases) == 0 {
+		return nil
+	}
+	return aliases
+}
+
+func ensureSessionMetadata(store session.SessionStore, key string, scope *session.SessionScope, aliases []string) {
+	if key == "" || scope == nil {
+		return
+	}
+	metaStore, ok := store.(interface {
+		EnsureSessionMetadata(sessionKey string, scope *session.SessionScope, aliases []string)
+	})
+	if !ok {
+		return
+	}
+	metaStore.EnsureSessionMetadata(key, scope, aliases)
 }
 
 func (al *AgentLoop) allocateRouteSession(route routing.ResolvedRoute, msg bus.InboundMessage) session.Allocation {
@@ -1667,6 +1706,8 @@ func (al *AgentLoop) runAgentLoop(
 			)
 		}
 	}
+
+	ensureSessionMetadata(agent.Sessions, opts.SessionKey, opts.SessionScope, opts.SessionAliases)
 
 	turnScope := al.newTurnEventScope(
 		agent.ID,

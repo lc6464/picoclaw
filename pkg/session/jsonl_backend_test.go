@@ -177,3 +177,31 @@ func TestJSONLBackend_SummarizeFlow(t *testing.T) {
 		t.Errorf("first message = %q, want %q", history[0].Content, "msg 16")
 	}
 }
+
+func TestJSONLBackend_ResolveAliasAndPersistMetadata(t *testing.T) {
+	b := newBackend(t)
+
+	b.EnsureSessionMetadata("canonical", &session.SessionScope{
+		Version:    session.ScopeVersionV1,
+		AgentID:    "main",
+		Channel:    "telegram",
+		Account:    "default",
+		Dimensions: []string{"chat"},
+		Values: map[string]string{
+			"chat": "group:c1",
+		},
+	}, []string{"legacy"})
+
+	if got := b.ResolveSessionKey("legacy"); got != "canonical" {
+		t.Fatalf("ResolveSessionKey() = %q, want %q", got, "canonical")
+	}
+
+	b.AddMessage("legacy", "user", "hello through alias")
+	history := b.GetHistory("canonical")
+	if len(history) != 1 {
+		t.Fatalf("len(history) = %d, want 1", len(history))
+	}
+	if history[0].Content != "hello through alias" {
+		t.Fatalf("history[0].Content = %q, want %q", history[0].Content, "hello through alias")
+	}
+}

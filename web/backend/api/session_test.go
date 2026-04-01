@@ -215,6 +215,83 @@ func TestHandleGetSession_JSONLStorage(t *testing.T) {
 	}
 }
 
+func TestHandleSessions_JSONLScopeDiscovery(t *testing.T) {
+	configPath, cleanup := setupOAuthTestEnv(t)
+	defer cleanup()
+
+	dir := sessionsTestDir(t, configPath)
+	store, err := memory.NewJSONLStore(dir)
+	if err != nil {
+		t.Fatalf("NewJSONLStore() error = %v", err)
+	}
+
+	sessionKey := "sk_v1_scope_discovery"
+	addErr := store.AddFullMessage(nil, sessionKey, providers.Message{
+		Role:    "user",
+		Content: "scope discovered session",
+	})
+	if addErr != nil {
+		t.Fatalf("AddFullMessage() error = %v", addErr)
+	}
+	summaryErr := store.SetSummary(nil, sessionKey, "scope summary")
+	if summaryErr != nil {
+		t.Fatalf("SetSummary() error = %v", summaryErr)
+	}
+
+	scopeData, err := json.Marshal(session.SessionScope{
+		Version:    session.ScopeVersionV1,
+		AgentID:    "main",
+		Channel:    "pico",
+		Account:    "default",
+		Dimensions: []string{"sender"},
+		Values: map[string]string{
+			"sender": "pico:scope-jsonl",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal(scope) error = %v", err)
+	}
+	if err := store.UpsertSessionMeta(nil, sessionKey, scopeData, nil); err != nil {
+		t.Fatalf("UpsertSessionMeta() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	listRec := httptest.NewRecorder()
+	listReq := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	mux.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d, body=%s", listRec.Code, http.StatusOK, listRec.Body.String())
+	}
+
+	var items []sessionListItem
+	if err := json.Unmarshal(listRec.Body.Bytes(), &items); err != nil {
+		t.Fatalf("Unmarshal(list) error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	if items[0].ID != "scope-jsonl" {
+		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, "scope-jsonl")
+	}
+
+	detailRec := httptest.NewRecorder()
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/sessions/scope-jsonl", nil)
+	mux.ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d, body=%s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+
+	deleteRec := httptest.NewRecorder()
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/sessions/scope-jsonl", nil)
+	mux.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want %d, body=%s", deleteRec.Code, http.StatusNoContent, deleteRec.Body.String())
+	}
+}
+
 func TestHandleDeleteSession_JSONLStorage(t *testing.T) {
 	configPath, cleanup := setupOAuthTestEnv(t)
 	defer cleanup()
