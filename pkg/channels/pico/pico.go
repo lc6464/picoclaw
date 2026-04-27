@@ -328,6 +328,12 @@ func (c *PicoChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]stri
 	switch {
 	case isThought:
 		payload[PayloadKeyKind] = MessageKindThought
+
+		// This field is kept solely for compatibility with legacy pico clients that
+		// do not yet support the newer "kind" field.
+		// DO NOT use it for any purpose other than legacy client compatibility.
+		payload[PayloadKeyThought] = true
+
 	case isToolCalls:
 		payload[PayloadKeyKind] = MessageKindToolCalls
 		if toolCalls, ok := picoToolCallsPayload(msg); ok {
