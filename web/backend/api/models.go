@@ -51,6 +51,48 @@ type modelResponse struct {
 	IsVirtual bool   `json:"is_virtual"`
 }
 
+func legacyUnsupportedASRProviderAndModel(rawModel string) (provider, modelID string, ok bool) {
+	provider, modelID, found := strings.Cut(strings.TrimSpace(rawModel), "/")
+	if !found {
+		return "", "", false
+	}
+
+	provider = providers.NormalizeProvider(provider)
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return "", "", false
+	}
+
+	switch provider {
+	case "elevenlabs":
+		// Keep the documented legacy ASR-only form elevenlabs/scribe_v1 stable
+		// even though elevenlabs is not part of the general model provider
+		// catalog exposed by the Web model-management UI.
+		return provider, modelID, true
+	default:
+		return "", "", false
+	}
+}
+
+func isLegacyUnsupportedASRModelConfig(mc *config.ModelConfig) bool {
+	if mc == nil || strings.TrimSpace(mc.Provider) != "" {
+		return false
+	}
+
+	_, _, ok := legacyUnsupportedASRProviderAndModel(mc.Model)
+	return ok
+}
+
+func responseProviderAndModel(mc *config.ModelConfig) (provider, modelID string) {
+	if strings.TrimSpace(mc.Provider) == "" {
+		if legacyProvider, legacyModelID, ok := legacyUnsupportedASRProviderAndModel(mc.Model); ok {
+			return legacyProvider, legacyModelID
+		}
+	}
+
+	return providers.ExtractProtocol(mc)
+}
+
 func normalizeStoredModelConfig(mc *config.ModelConfig) bool {
 	if mc == nil {
 		return false
@@ -81,6 +123,9 @@ func normalizeStoredModelConfig(mc *config.ModelConfig) bool {
 		}
 		return changed
 	}
+	if isLegacyUnsupportedASRModelConfig(mc) {
+		return changed
+	}
 
 	effectiveProvider, modelID := providers.SplitModelProviderAndID(model, "openai")
 	if effectiveProvider == "" {
@@ -106,6 +151,9 @@ func normalizeIncomingModelConfig(mc *config.ModelConfig) {
 	mc.Provider = strings.TrimSpace(mc.Provider)
 	mc.AuthMethod = strings.ToLower(strings.TrimSpace(mc.AuthMethod))
 	if mc.Provider == "" {
+		if isLegacyUnsupportedASRModelConfig(mc) {
+			return
+		}
 		mc.Provider, mc.Model = providers.SplitModelProviderAndID(mc.Model, "openai")
 	} else {
 		mc.Provider = providers.NormalizeProvider(mc.Provider)
@@ -159,6 +207,9 @@ func validateIncomingModelConfig(mc *config.ModelConfig, existing *config.ModelC
 		return err
 	}
 	if strings.TrimSpace(mc.Provider) == "" {
+		if existing != nil && isLegacyUnsupportedASRModelConfig(existing) && isLegacyUnsupportedASRModelConfig(mc) {
+			return nil
+		}
 		return fmt.Errorf("provider is required")
 	}
 	if !providers.IsSupportedModelProvider(mc.Provider) {
@@ -215,7 +266,7 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	models := make([]modelResponse, 0, len(cfg.ModelList))
 	for i, m := range cfg.ModelList {
-		provider, modelID := providers.ExtractProtocol(m)
+		provider, modelID := responseProviderAndModel(m)
 		models = append(models, modelResponse{
 			Index:          i,
 			ModelName:      m.ModelName,
@@ -386,20 +437,36 @@ func (h *Handler) handleUpdateModel(w http.ResponseWriter, r *http.Request) {
 		// This keeps provider-omitted updates backward-compatible even when an
 		// older client edits the visible model ID.
 		if strings.TrimSpace(cfg.ModelList[idx].Provider) == "" {
-			existingProtocol, existingModelID := providers.ExtractProtocol(cfg.ModelList[idx])
 			existingRawModel := strings.TrimSpace(cfg.ModelList[idx].Model)
 			incomingModel := strings.TrimSpace(mc.Model)
-			if existingRawModel != "" && existingRawModel != existingModelID && incomingModel != "" {
-				if incomingModel == existingModelID {
-					mc.Model = existingRawModel
-				} else if strings.Contains(incomingModel, "/") && !strings.Contains(existingModelID, "/") {
-					// Older clients never saw the hidden provider prefix for simple
-					// legacy entries such as "openai/gpt-4o". If they now send an
-					// explicit provider/model string, treat it as the caller's full
-					// intent instead of re-applying the old hidden prefix.
-					mc.Model = incomingModel
-				} else if !strings.HasPrefix(incomingModel, existingProtocol+"/") {
-					mc.Model = existingProtocol + "/" + incomingModel
+			if legacyProvider, legacyModelID, ok := legacyUnsupportedASRProviderAndModel(existingRawModel); ok {
+				if incomingModel != "" {
+					if incomingModel == legacyModelID {
+						mc.Model = existingRawModel
+					} else if strings.Contains(incomingModel, "/") && !strings.Contains(legacyModelID, "/") {
+						// Older clients only saw the visible legacy ASR model ID
+						// (for example "scribe_v1"). If they now send an explicit
+						// provider/model string, keep that full intent instead of
+						// silently re-applying the hidden ElevenLabs prefix.
+						mc.Model = incomingModel
+					} else if !strings.HasPrefix(incomingModel, legacyProvider+"/") {
+						mc.Model = legacyProvider + "/" + incomingModel
+					}
+				}
+			} else {
+				existingProtocol, existingModelID := providers.ExtractProtocol(cfg.ModelList[idx])
+				if existingRawModel != "" && existingRawModel != existingModelID && incomingModel != "" {
+					if incomingModel == existingModelID {
+						mc.Model = existingRawModel
+					} else if strings.Contains(incomingModel, "/") && !strings.Contains(existingModelID, "/") {
+						// Older clients never saw the hidden provider prefix for simple
+						// legacy entries such as "openai/gpt-4o". If they now send an
+						// explicit provider/model string, treat it as the caller's full
+						// intent instead of re-applying the old hidden prefix.
+						mc.Model = incomingModel
+					} else if !strings.HasPrefix(incomingModel, existingProtocol+"/") {
+						mc.Model = existingProtocol + "/" + incomingModel
+					}
 				}
 			}
 		}
