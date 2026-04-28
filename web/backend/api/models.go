@@ -51,6 +51,145 @@ type modelResponse struct {
 	IsVirtual bool   `json:"is_virtual"`
 }
 
+func normalizeStoredModelConfig(mc *config.ModelConfig) bool {
+	if mc == nil {
+		return false
+	}
+
+	changed := false
+	model := strings.TrimSpace(mc.Model)
+	if model != mc.Model {
+		mc.Model = model
+		changed = true
+	}
+	provider := strings.TrimSpace(mc.Provider)
+	if provider != mc.Provider {
+		mc.Provider = provider
+		changed = true
+	}
+	authMethod := strings.ToLower(strings.TrimSpace(mc.AuthMethod))
+	if authMethod != mc.AuthMethod {
+		mc.AuthMethod = authMethod
+		changed = true
+	}
+
+	if provider != "" {
+		normalizedProvider := providers.NormalizeProvider(provider)
+		if providers.IsSupportedModelProvider(normalizedProvider) && normalizedProvider != provider {
+			mc.Provider = normalizedProvider
+			changed = true
+		}
+		return changed
+	}
+
+	effectiveProvider, modelID := providers.SplitModelProviderAndID(model, "openai")
+	if effectiveProvider == "" {
+		return changed
+	}
+	if mc.Provider != effectiveProvider {
+		mc.Provider = effectiveProvider
+		changed = true
+	}
+	if mc.Model != modelID {
+		mc.Model = modelID
+		changed = true
+	}
+	return changed
+}
+
+func normalizeIncomingModelConfig(mc *config.ModelConfig) {
+	if mc == nil {
+		return
+	}
+
+	mc.Model = strings.TrimSpace(mc.Model)
+	mc.Provider = strings.TrimSpace(mc.Provider)
+	mc.AuthMethod = strings.ToLower(strings.TrimSpace(mc.AuthMethod))
+	if mc.Provider == "" {
+		mc.Provider, mc.Model = providers.SplitModelProviderAndID(mc.Model, "openai")
+	} else {
+		mc.Provider = providers.NormalizeProvider(mc.Provider)
+	}
+	if mc.Provider == "antigravity" && mc.AuthMethod == "" {
+		mc.AuthMethod = "oauth"
+	}
+}
+
+func createAllowedForProvider(provider string) bool {
+	normalized := providers.NormalizeProvider(provider)
+	switch normalized {
+	case "bedrock":
+		// Bedrock currently authenticates through the AWS SDK credential chain
+		// (env vars, shared profiles, IAM roles, etc.), and this Web layer does
+		// not yet have a reliable preflight check for those credential sources.
+		// Keep it creatable in the catalog and let provider construction/runtime
+		// return the concrete AWS error when the environment is incomplete.
+		return true
+	case "claude-cli", "codex-cli":
+		return cliProviderCreateAllowedFromCurrentStatus(normalized)
+	default:
+		return providers.IsCreatableModelProvider(normalized)
+	}
+}
+
+// cliProviderCreateAllowedFromCurrentStatus intentionally reuses the existing
+// local model status pipeline so provider catalog gating follows the same CLI
+// executable probe used by launcher readiness.
+func cliProviderCreateAllowedFromCurrentStatus(provider string) bool {
+	status := modelConfigurationStatus(&config.ModelConfig{
+		Provider: provider,
+		Model:    provider,
+	})
+	return status.Available
+}
+
+func modelProviderOptionsForResponse() []providers.ModelProviderOption {
+	options := providers.ModelProviderOptions()
+	for i := range options {
+		options[i].CreateAllowed = createAllowedForProvider(options[i].ID)
+	}
+	return options
+}
+
+func validateIncomingModelConfig(mc *config.ModelConfig, existing *config.ModelConfig) error {
+	if mc == nil {
+		return fmt.Errorf("model config is required")
+	}
+	if err := mc.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(mc.Provider) == "" {
+		return fmt.Errorf("provider is required")
+	}
+	if !providers.IsSupportedModelProvider(mc.Provider) {
+		return fmt.Errorf("provider %q is not supported", mc.Provider)
+	}
+	if !createAllowedForProvider(mc.Provider) {
+		if existing == nil {
+			return fmt.Errorf("provider %q is not available for new models", mc.Provider)
+		}
+		existingProvider, _ := providers.ExtractProtocol(existing)
+		if providers.NormalizeProvider(existingProvider) != mc.Provider {
+			return fmt.Errorf("provider %q is not available for selection", mc.Provider)
+		}
+	}
+	return nil
+}
+
+func normalizeStoredModelProviders(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+
+	changed := false
+	for _, model := range cfg.ModelList {
+		if normalizeStoredModelConfig(model) {
+			changed = true
+		}
+	}
+	return changed
+}
+
 // handleListModels returns all model_list entries with masked API keys.
 //
 //	GET /api/models
@@ -104,9 +243,10 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"models":        models,
-		"total":         len(models),
-		"default_model": defaultModel,
+		"models":           models,
+		"total":            len(models),
+		"default_model":    defaultModel,
+		"provider_options": modelProviderOptionsForResponse(),
 	})
 }
 
@@ -132,7 +272,9 @@ func (h *Handler) handleAddModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = mc.Validate(); err != nil {
+	normalizeIncomingModelConfig(&mc.ModelConfig)
+
+	if err = validateIncomingModelConfig(&mc.ModelConfig, nil); err != nil {
 		http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -148,6 +290,7 @@ func (h *Handler) handleAddModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg.ModelList = append(cfg.ModelList, &mc.ModelConfig)
+	normalizeStoredModelProviders(cfg)
 
 	if err := config.SaveConfig(h.configPath, cfg); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save config: %v", err), http.StatusInternalServerError)
@@ -195,11 +338,6 @@ func (h *Handler) handleUpdateModel(w http.ResponseWriter, r *http.Request) {
 	var mc custom
 	if err = json.Unmarshal(body, &mc); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	if err = mc.Validate(); err != nil {
-		http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -267,7 +405,14 @@ func (h *Handler) handleUpdateModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	normalizeIncomingModelConfig(&mc.ModelConfig)
+	if err = validateIncomingModelConfig(&mc.ModelConfig, cfg.ModelList[idx]); err != nil {
+		http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
+		return
+	}
+
 	cfg.ModelList[idx] = &mc.ModelConfig
+	normalizeStoredModelProviders(cfg)
 
 	logger.Debugf("update model config: %#v", mc.ModelConfig)
 
