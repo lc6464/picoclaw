@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sipeed/picoclaw/pkg/audio/asr"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
@@ -91,6 +92,10 @@ func normalizeStoredModelConfig(mc *config.ModelConfig) bool {
 					mc.Model = strippedModel
 					changed = true
 				}
+			}
+			if strings.TrimSpace(mc.Model) != asr.ElevenLabsSupportedModelID() {
+				mc.Model = asr.ElevenLabsSupportedModelID()
+				changed = true
 			}
 		}
 		return changed
@@ -191,6 +196,9 @@ func validateIncomingModelConfig(mc *config.ModelConfig, existing *config.ModelC
 	if !providers.IsSupportedModelProvider(mc.Provider) {
 		return fmt.Errorf("provider %q is not supported", mc.Provider)
 	}
+	if mc.Provider == "elevenlabs" && strings.TrimSpace(mc.Model) != asr.ElevenLabsSupportedModelID() {
+		return fmt.Errorf("provider %q only supports model %q", mc.Provider, asr.ElevenLabsSupportedModelID())
+	}
 	if !createAllowedForProvider(mc.Provider) {
 		if existing == nil {
 			return fmt.Errorf("provider %q is not available for new models", mc.Provider)
@@ -226,6 +234,10 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	// Normalize legacy provider/model storage in memory so GET can round-trip
+	// through the current API shape without mutating the on-disk config.
+	normalizeStoredModelProviders(cfg)
 
 	defaultModel := cfg.Agents.Defaults.GetModelName()
 	modelStatuses := make([]modelConfigurationSummary, len(cfg.ModelList))

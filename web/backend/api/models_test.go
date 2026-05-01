@@ -870,6 +870,54 @@ func TestHandleAddModel_NormalizesLegacyElevenLabsASRConfig(t *testing.T) {
 	}
 }
 
+func TestHandleAddModel_NormalizesExplicitElevenLabsUnsupportedModelID(t *testing.T) {
+	configPath, cleanup := setupOAuthTestEnv(t)
+	defer cleanup()
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	cfg.ModelList = []*config.ModelConfig{{
+		ModelName: "elevenlabs-asr",
+		Provider:  "elevenlabs",
+		Model:     "scribe_v2",
+		APIKeys:   config.SimpleSecureStrings("sk_elevenlabs_test"),
+	}}
+	if err = config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/models", bytes.NewBufferString(`{
+		"model_name":"new-model",
+		"provider":"openai",
+		"model":"gpt-4o-mini",
+		"api_key":"sk-new-model-key"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	updated, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got := updated.ModelList[0].Provider; got != "elevenlabs" {
+		t.Fatalf("provider = %q, want %q after normalization", got, "elevenlabs")
+	}
+	if got := updated.ModelList[0].Model; got != "scribe_v1" {
+		t.Fatalf("model = %q, want %q after normalization", got, "scribe_v1")
+	}
+}
+
 func TestHandleAddModel_RejectsMissingCLIProviderCommand(t *testing.T) {
 	configPath, cleanup := setupOAuthTestEnv(t)
 	defer cleanup()
@@ -1400,6 +1448,81 @@ func TestHandleUpdateModel_MigratesLegacyElevenLabsASRWhenProviderOmitted(t *tes
 	}
 }
 
+func TestHandleUpdateModel_RoundTripsExplicitLegacyElevenLabsModelID(t *testing.T) {
+	configPath, cleanup := setupOAuthTestEnv(t)
+	defer cleanup()
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	cfg.ModelList = []*config.ModelConfig{{
+		ModelName: "elevenlabs-asr",
+		Provider:  "elevenlabs",
+		Model:     "scribe_v2",
+		APIKeys:   config.SimpleSecureStrings("sk_elevenlabs_test"),
+	}}
+	if err = config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	recList := httptest.NewRecorder()
+	reqList := httptest.NewRequest(http.MethodGet, "/api/models", nil)
+	mux.ServeHTTP(recList, reqList)
+
+	if recList.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d, body=%s", recList.Code, http.StatusOK, recList.Body.String())
+	}
+
+	var listResp struct {
+		Models []modelResponse `json:"models"`
+	}
+	if err = json.Unmarshal(recList.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(listResp.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1", len(listResp.Models))
+	}
+	if got := listResp.Models[0].Provider; got != "elevenlabs" {
+		t.Fatalf("provider = %q, want %q", got, "elevenlabs")
+	}
+	if got := listResp.Models[0].Model; got != "scribe_v1" {
+		t.Fatalf("model = %q, want %q after GET normalization", got, "scribe_v1")
+	}
+
+	recUpdate := httptest.NewRecorder()
+	reqUpdate := httptest.NewRequest(http.MethodPut, "/api/models/0", bytes.NewBufferString(`{
+		"model_name":"elevenlabs-asr",
+		"provider":"elevenlabs",
+		"model":"scribe_v1",
+		"api_base":"https://api.elevenlabs.io"
+	}`))
+	reqUpdate.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(recUpdate, reqUpdate)
+
+	if recUpdate.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want %d, body=%s", recUpdate.Code, http.StatusOK, recUpdate.Body.String())
+	}
+
+	updated, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got := updated.ModelList[0].Provider; got != "elevenlabs" {
+		t.Fatalf("provider = %q, want %q", got, "elevenlabs")
+	}
+	if got := updated.ModelList[0].Model; got != "scribe_v1" {
+		t.Fatalf("model = %q, want %q", got, "scribe_v1")
+	}
+	if got := updated.ModelList[0].APIBase; got != "https://api.elevenlabs.io" {
+		t.Fatalf("api_base = %q, want %q", got, "https://api.elevenlabs.io")
+	}
+}
+
 func TestHandleUpdateModel_ClearsDefaultWhenSavingASROnlyModel(t *testing.T) {
 	configPath, cleanup := setupOAuthTestEnv(t)
 	defer cleanup()
@@ -1443,6 +1566,31 @@ func TestHandleUpdateModel_ClearsDefaultWhenSavingASROnlyModel(t *testing.T) {
 	}
 	if got := updated.Agents.Defaults.ModelName; got != "" {
 		t.Fatalf("default model = %q, want cleared default", got)
+	}
+}
+
+func TestHandleAddModel_RejectsUnsupportedElevenLabsModelID(t *testing.T) {
+	configPath, cleanup := setupOAuthTestEnv(t)
+	defer cleanup()
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/models", bytes.NewBufferString(`{
+		"model_name":"elevenlabs-asr",
+		"provider":"elevenlabs",
+		"model":"scribe_v2"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `provider "elevenlabs" only supports model "scribe_v1"`) {
+		t.Fatalf("body = %q, want elevenlabs model validation error", rec.Body.String())
 	}
 }
 
