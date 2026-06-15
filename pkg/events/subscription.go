@@ -261,7 +261,10 @@ func (s *eventSubscription) handle(ctx context.Context, evt Event) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("events: subscriber %q timeout-handler goroutine panic recovered: %v\n%s", s.name, r, debug.Stack())
+				log.Printf(
+					"events: subscriber %q timeout-handler goroutine panic recovered: %v\n%s",
+					s.name, r, debug.Stack(),
+				)
 				done <- handlerResult{panicked: true}
 			}
 		}()
@@ -316,7 +319,10 @@ func (s *eventSubscription) watchContext(ctx context.Context) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("events: subscriber %q watchContext goroutine panic recovered: %v\n%s", s.name, r, debug.Stack())
+				log.Printf(
+					"events: subscriber %q watchContext goroutine panic recovered: %v\n%s",
+					s.name, r, debug.Stack(),
+				)
 			}
 		}()
 		select {
